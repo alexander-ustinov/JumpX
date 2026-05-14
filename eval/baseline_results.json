@@ -1,0 +1,8 @@
+{
+  "model": "Qwen/Qwen3.5-9B-Base",
+  "mmlu_accuracy": 0.787,
+  "quality_accuracy": 0.875,
+  "mmlu_N": 2000,
+  "quality_N": 2000,
+  "quality_max_len": 5000
+}

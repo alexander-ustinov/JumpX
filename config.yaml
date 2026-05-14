@@ -1,0 +1,25 @@
+model:
+  name: "Qwen/Qwen3.5-9B-Base"
+  dtype: "bfloat16"
+
+trainer:
+  seq_len: 2048
+  batch_size: 2
+  accum_steps: 8
+  lr_muon: 1e-3
+  lr_adam: 1e-4
+  train_steps: 200000
+  log_steps: 100
+  log_prev_steps: 500
+  save_steps: 5000
+  eval_steps: 1000
+  log_file: "training_log.txt"
+  checkpoint_dir: "checkpoints"
+  eval_log_file: "/home/jovyan/nachevsky/Experiments/JumpX/eval/eval.txt"
+
+eval_mmlu:
+  N: 2000
+
+eval_quality:
+  N: 2000
+  max_len: 5000
