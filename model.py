@@ -35,16 +35,18 @@ def pair_key(pair):
     return f"{pair[0]}_{pair[1]}"
 
 
+
+
 class JumpQwen(nn.Module):
 
-    def __init__(self, base_model, lm_head, cfg):
+    def __init__(self, base_model, lm_head, cfg, target_pairs=None):
         super().__init__()
 
         self.cfg = cfg
         self.base_model = base_model
         self.layers = self.base_model.layers
         self.layer_types = self.base_model.config.layer_types
-        self.target_pairs = [[22, 28]]
+        self.target_pairs = target_pairs or [[22, 28]]
         self.starts = [x[0] for x in self.target_pairs]
         self.ends = [x[1] for x in self.target_pairs]
         self.lm_head = lm_head
@@ -67,7 +69,18 @@ class JumpQwen(nn.Module):
     def _lenses(self):
         return self.lenses.module if hasattr(self.lenses, "module") else self.lenses
 
-                   
+
+    @classmethod
+    def from_checkpoint(cls, ckpt_path: str, start_layer: int, end_layer: int, base_model, lm_head, cfg=None, device="cuda"):
+        """Load JumpQwen from a checkpoint with explicit start/end layers."""
+        sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        model = cls(base_model, lm_head, cfg, target_pairs=[[start_layer, end_layer]])
+
+        model.lenses.load_state_dict(sd)
+        model.lenses.to(device)
+
+        return model
+
 
     def forward(self, input_ids):
 
