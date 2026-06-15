@@ -7,6 +7,8 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from data_stream import StreamingDataset
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import fully_shard
+from torch.distributed.device_mesh import init_device_mesh
 
 
 class JumpExperiment():
@@ -23,8 +25,9 @@ class JumpExperiment():
         dist.barrier()
 
         self.base_model, self.tokenizer, self.lm_head = self.prepare_model_and_tokenizer()
+        self._shard_base_model()
         dist.barrier()
-            
+
         self.JumpQwen = JumpQwen(self.base_model, self.lm_head, self.cfg)
 
         self.JumpQwen.lenses = self.JumpQwen.lenses.to(self.device)
@@ -57,7 +60,7 @@ class JumpExperiment():
         llm = AutoModelForCausalLM.from_pretrained(
             self.cfg.model.name,
             dtype=getattr(torch, self.cfg.model.dtype),
-            attn_implementation="eager",
+            attn_implementation=self.cfg.model.get("attn_implementation", "sdpa"),
             trust_remote_code=True,
         ).to(self.device).eval()
 
@@ -72,11 +75,42 @@ class JumpExperiment():
         return text_model, tokenizer, lm_head
 
 
+    def _shard_base_model(self):
+        """FSDP2-shard the frozen transformer layers across ranks.
+
+        Only the decoder layers (the bulk of the params) are sharded; they are
+        called both by the teacher's full forward and by JumpQwen's manual
+        per-layer forward, and per-module FSDP hooks fire in both cases.
+        embed_tokens / norm / lm_head stay replicated (small, frozen), and the
+        trainable lenses are left on DDP so Muon sees full (unsharded) matrices.
+        """
+        if self.world_size < 2:
+            return
+
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated() / 1e9
+
+        mesh = init_device_mesh("cuda", (self.world_size,))
+        for layer in self.base_model.layers:
+            # reshard_after_forward=True is essential here: each layer is its
+            # own FSDP root (no parent FSDP module wraps them), and roots
+            # otherwise default to keeping params gathered after forward — which
+            # would re-materialise the whole model and wipe out the sharding.
+            fully_shard(layer, mesh=mesh, reshard_after_forward=True)
+
+        torch.cuda.synchronize()
+        after = torch.cuda.memory_allocated() / 1e9
+        if self.is_main_process:
+            print(f"[FSDP] num_layers={len(self.base_model.layers)} "
+                  f"allocated before_shard={before:.2f}GB after_shard={after:.2f}GB",
+                  flush=True)
+
     def _init_distributed(self):
         
         dist.init_process_group("nccl")
         self.rank = dist.get_rank()
         self.device = torch.device(f"cuda:{self.rank}")
+        torch.cuda.set_device(self.device)
         self.world_size = dist.get_world_size()
         self.is_main_process = self.rank == 0
 

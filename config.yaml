@@ -1,6 +1,7 @@
 model:
   name: "Qwen/Qwen3.5-9B-Base"
   dtype: "bfloat16"
+  attn_implementation: "sdpa"
 
 trainer:
   seq_len: 2048
