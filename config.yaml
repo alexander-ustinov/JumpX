@@ -8,6 +8,7 @@ trainer:
   batch_size: 2
   accum_steps: 8
   loss_chunk_tokens: 1024
+  grad_checkpointing: true
   lr_muon: 1e-3
   lr_adam: 1e-4
   train_steps: 200000

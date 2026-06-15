@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 def make_causal_mask(
@@ -43,6 +44,9 @@ class JumpQwen(nn.Module):
         super().__init__()
 
         self.cfg = cfg
+        self.grad_checkpointing = False
+        if cfg is not None:
+            self.grad_checkpointing = bool(cfg.trainer.get("grad_checkpointing", False))
         self.base_model = base_model
         self.layers = self.base_model.layers
         self.layer_types = self.base_model.config.layer_types
@@ -68,6 +72,14 @@ class JumpQwen(nn.Module):
     @property
     def _lenses(self):
         return self.lenses.module if hasattr(self.lenses, "module") else self.lenses
+
+
+    def _call_layer(self, idx, hiddens, pos_embs, layer_mask):
+        return self.base_model.layers[idx](
+            hiddens,
+            position_embeddings=pos_embs,
+            attention_mask=layer_mask,
+        )
 
 
     @classmethod
@@ -97,11 +109,17 @@ class JumpQwen(nn.Module):
 
             layer_mask = None if self.layer_types[idx] == "linear_attention" else causal_mask
 
-            hiddens = self.base_model.layers[idx](
-                hiddens,
-                position_embeddings=pos_embs,
-                attention_mask=layer_mask,
-            )
+            # Checkpoint only post-lens layers (the ones that run with grad and
+            # store activations for backward). Pre-lens layers feed the lens'
+            # detach() and build no graph, so checkpointing them would be pure
+            # overhead. use_reentrant=False composes with FSDP2 re-gather.
+            if self.grad_checkpointing and hiddens.requires_grad:
+                hiddens = checkpoint(
+                    self._call_layer, idx, hiddens, pos_embs, layer_mask,
+                    use_reentrant=False,
+                )
+            else:
+                hiddens = self._call_layer(idx, hiddens, pos_embs, layer_mask)
 
             if idx in self.starts:
                 hiddens = self._lenses[str(idx)](hiddens.detach())
