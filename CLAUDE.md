@@ -34,6 +34,17 @@ python common/verify_forward.py
 
 `train.py` uses `fire`, so any `config.*` value can also be overridden on the CLI. There is no test suite; `common/verify_forward.py` is the closest thing to a correctness test and should be re-run whenever `JumpQwen.forward` or the manual forward logic changes.
 
+### Before every GPU run: check the GPUs are free and wait for them
+This box is shared. **Before launching any run that uses the GPU** (`train.py`, `eval_baseline.py`, `inference.py`, smoke tests), check that no other process is using the GPUs, and if something is, **wait for it to finish** before starting — do not launch into contention (it causes OOM at model load, since the 9B model needs the whole card). Other users' jobs (e.g. `python main.py --method ...`) routinely occupy both cards; never kill a process you did not start.
+
+Always launch GPU jobs through the **`scripts/gpu_wait.sh`** wrapper, which polls `nvidia-smi` every 5 s until the GPUs are free, then `exec`s the command:
+
+```bash
+scripts/gpu_wait.sh torchrun --nproc_per_node=<N> train.py --config config.yaml
+```
+
+This is **enforced** by a `PreToolUse` Bash hook (`.claude/settings.json` → `.claude/hooks/gpu_run_gate.sh`): raw GPU-launch commands (`torchrun`, or `python …{train,eval_baseline,inference,run_smoke}.py`) that are not routed through `gpu_wait.sh` are denied with a reminder. Override interval with `GPU_WAIT_INTERVAL`.
+
 ## Architecture / control flow
 
 - `train.py` → `JumpTrainer(config)` (`trainer.py`) → `JumpExperiment(config)` (`src/tuned_exp.py`).
