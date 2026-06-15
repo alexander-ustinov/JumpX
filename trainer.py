@@ -5,6 +5,7 @@ from collections import defaultdict, deque
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from torch.optim import AdamW, Muon
 from src.tuned_exp import JumpExperiment
 from tqdm import tqdm
@@ -40,20 +41,42 @@ class JumpTrainer:
 
             teacher_logits = self.compute_teacher_logits(batch)
             V = teacher_logits.shape[-1]
-            teacher_probs = F.softmax(teacher_logits.reshape(-1, V).float(), dim=-1)
-            del teacher_logits
+            teacher_logits = teacher_logits.reshape(-1, V)
 
-            jump_logits = self.experiment.JumpQwen(batch)
+            jump_logits = self.experiment.JumpQwen(batch).reshape(-1, V)
+            N = jump_logits.shape[0]
 
-            loss = F.kl_div(
-                F.log_softmax(jump_logits.reshape(-1, V).float(), dim=-1),
-                teacher_probs,
-                reduction="batchmean",
-            ) / self.cfg.trainer.accum_steps
+            # Chunked KL over the token dimension. Each chunk's fp32 softmax /
+            # log_softmax / kl_div intermediates (the [N, V] memory blow-up) are
+            # recomputed one at a time inside activation checkpoints, so the
+            # peak fp32 footprint is bounded to a single chunk instead of all N
+            # tokens at once. Single backward() keeps DDP behaviour unchanged.
+            chunk = getattr(self.cfg.trainer, "loss_chunk_tokens", 1024)
+
+            loss = jump_logits.new_zeros((), dtype=torch.float32)
+            for start in range(0, N, chunk):
+                end = min(start + chunk, N)
+                loss = loss + checkpoint(
+                    self._chunk_kl,
+                    jump_logits[start:end],
+                    teacher_logits[start:end],
+                    use_reentrant=False,
+                )
+
+            # batchmean: divide the summed KL by the total number of tokens.
+            loss = loss / N / self.cfg.trainer.accum_steps
 
             loss.backward()
 
         return loss.item()
+
+    @staticmethod
+    def _chunk_kl(student_logits_chunk, teacher_logits_chunk):
+        # fp32 for numerical stability; reduction="sum" so the caller can
+        # normalise by the full token count to reproduce "batchmean".
+        teacher_probs = F.softmax(teacher_logits_chunk.float(), dim=-1)
+        student_logp = F.log_softmax(student_logits_chunk.float(), dim=-1)
+        return F.kl_div(student_logp, teacher_probs, reduction="sum")
 
     def train(self):
 
