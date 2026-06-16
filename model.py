@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 def make_causal_mask(
@@ -43,6 +44,9 @@ class JumpQwen(nn.Module):
         super().__init__()
 
         self.cfg = cfg
+        self.grad_checkpointing = False
+        if cfg is not None:
+            self.grad_checkpointing = bool(cfg.trainer.get("grad_checkpointing", False))
         self.base_model = base_model
         self.layers = self.base_model.layers
         self.layer_types = self.base_model.config.layer_types
@@ -70,6 +74,14 @@ class JumpQwen(nn.Module):
         return self.lenses.module if hasattr(self.lenses, "module") else self.lenses
 
 
+    def _call_layer(self, idx, hiddens, pos_embs, layer_mask):
+        return self.base_model.layers[idx](
+            hiddens,
+            position_embeddings=pos_embs,
+            attention_mask=layer_mask,
+        )
+
+
     @classmethod
     def from_checkpoint(cls, ckpt_path: str, start_layer: int, end_layer: int, base_model, lm_head, cfg=None, device="cuda"):
         """Load JumpQwen from a checkpoint with explicit start/end layers."""
@@ -82,7 +94,7 @@ class JumpQwen(nn.Module):
         return model
 
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, return_hidden=False):
 
         embeds = self.base_model.embed_tokens(input_ids)
         seq_len = embeds.shape[1]
@@ -97,11 +109,17 @@ class JumpQwen(nn.Module):
 
             layer_mask = None if self.layer_types[idx] == "linear_attention" else causal_mask
 
-            hiddens = self.base_model.layers[idx](
-                hiddens,
-                position_embeddings=pos_embs,
-                attention_mask=layer_mask,
-            )
+            # Checkpoint only post-lens layers (the ones that run with grad and
+            # store activations for backward). Pre-lens layers feed the lens'
+            # detach() and build no graph, so checkpointing them would be pure
+            # overhead. use_reentrant=False composes with FSDP2 re-gather.
+            if self.grad_checkpointing and hiddens.requires_grad:
+                hiddens = checkpoint(
+                    self._call_layer, idx, hiddens, pos_embs, layer_mask,
+                    use_reentrant=False,
+                )
+            else:
+                hiddens = self._call_layer(idx, hiddens, pos_embs, layer_mask)
 
             if idx in self.starts:
                 hiddens = self._lenses[str(idx)](hiddens.detach())
@@ -110,6 +128,11 @@ class JumpQwen(nn.Module):
             else:
                 idx += 1
 
-        jump_logits = self.lm_head(self.base_model.norm(hiddens))
+        hidden = self.base_model.norm(hiddens)
 
-        return jump_logits
+        # Training applies lm_head per token-chunk in the loss to avoid
+        # materialising full [B, L, V] logits; eval/inference want logits.
+        if return_hidden:
+            return hidden
+
+        return self.lm_head(hidden)

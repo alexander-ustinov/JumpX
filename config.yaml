@@ -1,11 +1,14 @@
 model:
   name: "Qwen/Qwen3.5-9B-Base"
   dtype: "bfloat16"
+  attn_implementation: "sdpa"
 
 trainer:
   seq_len: 2048
   batch_size: 2
   accum_steps: 8
+  loss_chunk_tokens: 256
+  grad_checkpointing: true
   lr_muon: 1e-3
   lr_adam: 1e-4
   train_steps: 200000

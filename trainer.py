@@ -5,6 +5,7 @@ from collections import defaultdict, deque
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from torch.optim import AdamW, Muon
 from src.tuned_exp import JumpExperiment
 from tqdm import tqdm
@@ -38,22 +39,47 @@ class JumpTrainer:
         with ctx:
             batch = batch.to(self.experiment.device)
 
-            teacher_logits = self.compute_teacher_logits(batch)
-            V = teacher_logits.shape[-1]
-            teacher_probs = F.softmax(teacher_logits.reshape(-1, V).float(), dim=-1)
-            del teacher_logits
+            teacher_hidden = self.compute_teacher_hidden(batch)
+            D = teacher_hidden.shape[-1]
+            teacher_hidden = teacher_hidden.reshape(-1, D)
 
-            jump_logits = self.experiment.JumpQwen(batch)
+            student_hidden = self.experiment.JumpQwen(batch, return_hidden=True).reshape(-1, D)
+            N = student_hidden.shape[0]
 
-            loss = F.kl_div(
-                F.log_softmax(jump_logits.reshape(-1, V).float(), dim=-1),
-                teacher_probs,
-                reduction="batchmean",
-            ) / self.cfg.trainer.accum_steps
+            # Chunked LM-head + KL: apply the vocab projection and the KL per
+            # token chunk inside activation checkpoints, working from hidden
+            # states ([N, D], tiny) rather than logits. The full [N, V] logits
+            # for teacher and student are never materialised — only [chunk, V]
+            # at a time, recomputed in backward. Single backward() keeps DDP
+            # behaviour unchanged.
+            chunk = getattr(self.cfg.trainer, "loss_chunk_tokens", 1024)
+
+            loss = student_hidden.new_zeros((), dtype=torch.float32)
+            for start in range(0, N, chunk):
+                end = min(start + chunk, N)
+                loss = loss + checkpoint(
+                    self._chunk_kl_from_hidden,
+                    student_hidden[start:end],
+                    teacher_hidden[start:end],
+                    use_reentrant=False,
+                )
+
+            # batchmean: divide the summed KL by the total number of tokens.
+            loss = loss / N / self.cfg.trainer.accum_steps
 
             loss.backward()
 
         return loss.item()
+
+    def _chunk_kl_from_hidden(self, student_hidden_chunk, teacher_hidden_chunk):
+        # Project this token chunk to vocab logits with the frozen lm_head, then
+        # KL in fp32. reduction="sum" so the caller normalises by the full token
+        # count to reproduce "batchmean".
+        student_logits = self.experiment.lm_head(student_hidden_chunk)
+        teacher_logits = self.experiment.lm_head(teacher_hidden_chunk)
+        teacher_probs = F.softmax(teacher_logits.float(), dim=-1)
+        student_logp = F.log_softmax(student_logits.float(), dim=-1)
+        return F.kl_div(student_logp, teacher_probs, reduction="sum")
 
     def train(self):
 
@@ -104,12 +130,10 @@ class JumpTrainer:
             pbar.update(1)
 
     @torch.no_grad()
-    def compute_teacher_logits(self, batch):
-       
-        teacher_out = self.experiment.base_model(input_ids=batch, use_cache=False).last_hidden_state
-        teacher_logits = self.experiment.lm_head(teacher_out)
-
-        return teacher_logits
+    def compute_teacher_hidden(self, batch):
+        # Post-norm hidden states of the full (non-skipping) model; lm_head is
+        # applied per chunk in the loss to avoid full [B, L, V] logits.
+        return self.experiment.base_model(input_ids=batch, use_cache=False).last_hidden_state
 
     def log(self, step, step_loss, avg_loss, grad_norm):
 
