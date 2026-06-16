@@ -94,7 +94,7 @@ class JumpQwen(nn.Module):
         return model
 
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, return_hidden=False):
 
         embeds = self.base_model.embed_tokens(input_ids)
         seq_len = embeds.shape[1]
@@ -128,6 +128,11 @@ class JumpQwen(nn.Module):
             else:
                 idx += 1
 
-        jump_logits = self.lm_head(self.base_model.norm(hiddens))
+        hidden = self.base_model.norm(hiddens)
 
-        return jump_logits
+        # Training applies lm_head per token-chunk in the loss to avoid
+        # materialising full [B, L, V] logits; eval/inference want logits.
+        if return_hidden:
+            return hidden
+
+        return self.lm_head(hidden)
